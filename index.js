@@ -2,6 +2,8 @@ const express = require('express');
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const qrcode = require('qrcode');
 const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
 const { execSync } = require('child_process');
 
 const app = express();
@@ -13,44 +15,88 @@ const qrCodes = {};
 const clientStatus = {}; // renamed to avoid conflict with http status codes
 
 // ───────────────────────────────────────────────────────────
+// HELPER: Verify a path is a real executable file
+// ───────────────────────────────────────────────────────────
+function isRealExecutable(filePath) {
+    try {
+        const stat = fs.statSync(filePath);
+        return stat.isFile(); // must be a real file (not a directory)
+    } catch (_) {
+        return false;
+    }
+}
+
+// ───────────────────────────────────────────────────────────
 // HELPER: Find Chromium executable on the server
 // ───────────────────────────────────────────────────────────
 function findChromeExecutable() {
-    // List of common Chromium/Chrome paths on Linux servers
-    const candidates = [
+    // 1. Check env override first
+    if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+        if (isRealExecutable(process.env.PUPPETEER_EXECUTABLE_PATH)) {
+            console.log(`[Chrome] Found via PUPPETEER_EXECUTABLE_PATH: ${process.env.PUPPETEER_EXECUTABLE_PATH}`);
+            return process.env.PUPPETEER_EXECUTABLE_PATH;
+        }
+        console.warn(`[Chrome] PUPPETEER_EXECUTABLE_PATH set but file not found: ${process.env.PUPPETEER_EXECUTABLE_PATH}`);
+    }
+
+    // 2. System-installed Chrome/Chromium (most reliable)
+    const systemPaths = [
         '/usr/bin/chromium-browser',
         '/usr/bin/chromium',
         '/usr/bin/google-chrome-stable',
         '/usr/bin/google-chrome',
         '/snap/bin/chromium',
-        process.env.PUPPETEER_EXECUTABLE_PATH, // env override
-    ].filter(Boolean);
-
-    for (const candidate of candidates) {
-        try {
-            require('fs').accessSync(candidate, require('fs').constants.X_OK);
-            console.log(`[Chrome] Found executable: ${candidate}`);
-            return candidate;
-        } catch (_) {
-            // not found or not executable, try next
+    ];
+    for (const p of systemPaths) {
+        if (isRealExecutable(p)) {
+            console.log(`[Chrome] Found system Chrome: ${p}`);
+            return p;
         }
     }
 
-    // Last resort: check if puppeteer bundled its own chromium
+    // 3. Puppeteer bundled Chrome (search common cache directories)
+    const cacheDirs = [
+        process.env.PUPPETEER_CACHE_DIR,
+        path.join(process.env.HOME || '/root', '.cache', 'puppeteer'),
+        '/home/sbx_user1051/.cache/puppeteer', // Render
+        '/opt/render/.cache/puppeteer',         // Render alt
+    ].filter(Boolean);
+
+    // Try to find chrome binary inside puppeteer cache
+    for (const cacheDir of cacheDirs) {
+        try {
+            if (!fs.existsSync(cacheDir)) continue;
+            // Walk the cache directory to find a chrome binary
+            const entries = fs.readdirSync(cacheDir, { recursive: true });
+            for (const entry of entries) {
+                const full = path.join(cacheDir, entry);
+                if (entry.endsWith('chrome') && isRealExecutable(full)) {
+                    console.log(`[Chrome] Found puppeteer cached Chrome: ${full}`);
+                    return full;
+                }
+            }
+        } catch (_) {
+            // can't read directory, skip
+        }
+    }
+
+    // 4. Last resort: try puppeteer.executablePath() but VERIFY it exists
     try {
         const puppeteer = require('puppeteer');
-        // puppeteer-core / puppeteer may expose executablePath
         if (typeof puppeteer.executablePath === 'function') {
             const bundled = puppeteer.executablePath();
-            console.log(`[Chrome] Using puppeteer bundled: ${bundled}`);
-            return bundled;
+            if (isRealExecutable(bundled)) {
+                console.log(`[Chrome] Using puppeteer.executablePath: ${bundled}`);
+                return bundled;
+            }
+            console.warn(`[Chrome] puppeteer.executablePath() returned non-existent path: ${bundled}`);
         }
     } catch (_) {}
 
-    console.warn('[Chrome] WARNING: No Chrome/Chromium executable found!');
-    console.warn('[Chrome] Install it with: sudo apt-get install -y chromium-browser');
-    console.warn('[Chrome] Or set PUPPETEER_EXECUTABLE_PATH env variable');
-    return undefined; // let puppeteer try its default
+    console.warn('[Chrome] ❌ No Chrome/Chromium found anywhere!');
+    console.warn('[Chrome] On Render: make sure build command includes Chrome installation');
+    console.warn('[Chrome] On VPS: sudo apt-get install -y chromium-browser');
+    return undefined;
 }
 
 // ───────────────────────────────────────────────────────────
@@ -374,13 +420,24 @@ app.post('/logout/:tenantId', async (req, res) => {
 });
 
 // ── GET /health (server health check) ──
+// Cache the chrome path at startup (don't re-scan on every health check)
+let cachedChromePath = null;
+
 app.get('/health', (req, res) => {
-    const chromePath = findChromeExecutable();
+    if (!cachedChromePath) {
+        cachedChromePath = findChromeExecutable();
+    }
     res.json({
         status: 'ok',
         uptime: process.uptime(),
-        chromePath: chromePath || 'NOT FOUND',
+        chromePath: cachedChromePath || 'NOT FOUND',
+        chromeVerified: !!cachedChromePath,
         activeClients: Object.keys(clients).length,
+        env: {
+            PUPPETEER_EXECUTABLE_PATH: process.env.PUPPETEER_EXECUTABLE_PATH || 'not set',
+            PUPPETEER_CACHE_DIR: process.env.PUPPETEER_CACHE_DIR || 'not set',
+            HOME: process.env.HOME || 'not set',
+        },
     });
 });
 
@@ -402,14 +459,23 @@ app.listen(PORT, () => {
     console.log(`║   GET  /health                → Health check  ║`);
     console.log(`╚══════════════════════════════════════════════╝\n`);
 
-    // Log Chrome detection on startup
-    const chromePath = findChromeExecutable();
-    if (chromePath) {
-        console.log(`[Chrome] ✅ Found at: ${chromePath}`);
-    } else {
-        console.warn(`[Chrome] ❌ NOT FOUND! Install with:`);
-        console.warn(`  sudo apt-get install -y chromium-browser`);
-        console.warn(`  # OR`);
-        console.warn(`  PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium node index.js`);
+    // Detect and cache Chrome path at startup
+    cachedChromePath = findChromeExecutable();
+    if (cachedChromePath) {
+        console.log(`[Chrome] ✅ Verified at: ${cachedChromePath}`);
+        // Verify it actually launches
+        try {
+            const { execSync } = require('child_process');
+            const version = execSync(`"${cachedChromePath}" --version`).toString().trim();
+            console.log(`[Chrome] ✅ Version: ${version}`);
+        } catch (e) {
+            console.warn(`[Chrome] ⚠️  File exists but failed to run: ${e.message}`);
+            cachedChromePath = null; // don't use a broken binary
+        }
+    }
+    if (!cachedChromePath) {
+        console.error(`[Chrome] ❌ No working Chrome found! WhatsApp will NOT work.`);
+        console.error(`[Chrome] Fix: Add this build command on Render:`);
+        console.error(`[Chrome]   npm install puppeteer && npx puppeteer browsers install chrome`);
     }
 });
